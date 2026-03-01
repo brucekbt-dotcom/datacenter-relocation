@@ -11,6 +11,35 @@ import {
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 
 /* -----------------------------
+  Firebase & GCP Cloud DB Setup
+----------------------------- */
+import { initializeApp } from "firebase/app";
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "firebase/auth";
+import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot } from "firebase/firestore";
+
+declare global {
+  var __firebase_config: string | undefined;
+  var __app_id: string | undefined;
+  var __initial_auth_token: string | undefined;
+}
+
+// 判斷是否在預覽環境，若無則請替換為您在 GCP Firebase 申請的配置
+const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+const firebaseConfig = firebaseConfigStr ? JSON.parse(firebaseConfigStr) : {
+  // TODO: 未來正式上線 GCP 時，請將這段替換成您的 Firebase Config
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  projectId: "YOUR_PROJECT_ID",
+};
+
+const isFirebaseConfigured = firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY";
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'datacenter-relocation-app';
+
+/* -----------------------------
   Gemini API Setup
 ----------------------------- */
 const apiKey = ""; // 執行環境將自動提供 API Key
@@ -58,24 +87,6 @@ const AFTER_RACKS: Rack[] = [
   ...["B1", "B2", "B3", "B4", "B5", "B6"].map((n) => ({ id: `AFT_${n}`, name: n, units: 42 })),
 ];
 
-const mockDevices: Device[] = [
-  {
-    id: "dev-1", category: "Network", deviceId: "SW-CORE-001", name: "Core Switch", brand: "Cisco", model: "Catalyst 9500",
-    ports: 48, sizeU: 2, beforeRackId: "BEF_A1", beforeStartU: 40, beforeEndU: 41, connectedTo: ["dev-2", "dev-3"],
-    migration: { racked: true, cabled: true, powered: true, tested: true },
-  },
-  {
-    id: "dev-2", category: "Storage", deviceId: "STO-001", name: "Primary Storage", brand: "NetApp", model: "FAS8200",
-    ports: 8, sizeU: 4, beforeRackId: "BEF_A2", beforeStartU: 30, beforeEndU: 33, connectedTo: ["dev-1"],
-    migration: { racked: false, cabled: false, powered: false, tested: false },
-  },
-  {
-    id: "dev-3", category: "Server", deviceId: "SRV-APP-012", name: "App Server", brand: "Dell", model: "R740",
-    ports: 24, sizeU: 2, beforeRackId: "BEF_B6", beforeStartU: 10, beforeEndU: 11, connectedTo: ["dev-1"],
-    migration: { racked: false, cabled: false, powered: false, tested: false },
-  },
-];
-
 /* -----------------------------
   Store & Utils
 ----------------------------- */
@@ -95,9 +106,21 @@ interface Store {
   clearPlacement: (mode: PlacementMode, id: string) => void; place: (mode: PlacementMode, deviceId: string, rackId: string, startU: number) => { ok: boolean; message?: string };
 }
 
+const syncToFirebase = async (device: Device) => {
+  if (!isFirebaseConfigured) return;
+  try { await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'devices', device.id), device); } 
+  catch (e) { console.error("Firebase sync error:", e); }
+};
+
+const deleteFromFirebase = async (id: string) => {
+  if (!isFirebaseConfigured) return;
+  try { await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'devices', id)); } 
+  catch (e) { console.error("Firebase delete error:", e); }
+};
+
 const useStore = create<Store>((set, get) => ({
   beforeRacks: BEFORE_RACKS, afterRacks: AFTER_RACKS,
-  devices: readJson<Device[]>(LS.devices, mockDevices),
+  devices: readJson<Device[]>(LS.devices, []),
   theme: (localStorage.getItem(LS.theme) as ThemeMode) || "dark",
   themeStyle: (localStorage.getItem(LS.themeStyle) as ThemeStyle) || "neon",
   page: "dashboard", selectedDeviceId: null, ui: { sideCollapsed: false, unplacedCollapsedBefore: false, unplacedCollapsedAfter: false, ...readJson<UiState>(LS.ui, {}) },
@@ -117,10 +140,29 @@ const useStore = create<Store>((set, get) => ({
   setSelectedDeviceId: (id) => set({ selectedDeviceId: id }),
   setUi: (patch) => set((s) => { const next = { ...s.ui, ...patch }; writeJson(LS.ui, next); return { ui: next }; }),
   
-  addDevice: (draft) => set((s) => { const next = [...s.devices, { ...draft, id: crypto.randomUUID(), migration: { racked: false, cabled: false, powered: false, tested: false } } as Device]; writeJson(LS.devices, next); return { devices: next }; }),
-  updateDevice: (id, patch) => set((s) => { const next = s.devices.map((d) => (d.id === id ? ({ ...d, ...patch } as Device) : d)); writeJson(LS.devices, next); return { devices: next }; }),
-  deleteDeviceById: (id) => set((s) => { const next = s.devices.filter((d) => d.id !== id); writeJson(LS.devices, next); return { devices: next, selectedDeviceId: s.selectedDeviceId === id ? null : s.selectedDeviceId }; }),
-  clearPlacement: (mode, id) => set((s) => { const next = s.devices.map((d) => d.id !== id ? d : (mode === "before" ? { ...d, beforeRackId: undefined, beforeStartU: undefined, beforeEndU: undefined } : { ...d, afterRackId: undefined, afterStartU: undefined, afterEndU: undefined })); writeJson(LS.devices, next); return { devices: next }; }),
+  addDevice: (draft) => set((s) => { 
+    const newDevice = { ...draft, id: crypto.randomUUID(), migration: { racked: false, cabled: false, powered: false, tested: false } } as Device;
+    const next = [...s.devices, newDevice]; 
+    writeJson(LS.devices, next); syncToFirebase(newDevice); return { devices: next }; 
+  }),
+  updateDevice: (id, patch) => set((s) => { 
+    let updatedDevice: Device | null = null;
+    const next = s.devices.map((d) => { if (d.id === id) { updatedDevice = { ...d, ...patch }; return updatedDevice; } return d; }); 
+    writeJson(LS.devices, next); if (updatedDevice) syncToFirebase(updatedDevice); return { devices: next }; 
+  }),
+  deleteDeviceById: (id) => set((s) => { 
+    const next = s.devices.filter((d) => d.id !== id); 
+    writeJson(LS.devices, next); deleteFromFirebase(id); return { devices: next, selectedDeviceId: s.selectedDeviceId === id ? null : s.selectedDeviceId }; 
+  }),
+  clearPlacement: (mode, id) => set((s) => { 
+    let updatedDevice: Device | null = null;
+    const next = s.devices.map((d) => {
+      if (d.id !== id) return d;
+      updatedDevice = mode === "before" ? { ...d, beforeRackId: undefined, beforeStartU: undefined, beforeEndU: undefined } : { ...d, afterRackId: undefined, afterStartU: undefined, afterEndU: undefined };
+      return updatedDevice;
+    }); 
+    writeJson(LS.devices, next); if (updatedDevice) syncToFirebase(updatedDevice); return { devices: next }; 
+  }),
   place: (mode, deviceId, rackId, startU) => {
     const { devices } = get(); const dev = devices.find((d) => d.id === deviceId); if (!dev) return { ok: false, message: "找不到設備" };
     const sU = clampU(startU); const eU = sU + Math.max(1, Math.min(42, dev.sizeU)) - 1;
@@ -131,8 +173,16 @@ const useStore = create<Store>((set, get) => ({
       return rId === rackId && s != null && e != null && rangesOverlap(sU, eU, s, e);
     });
     if (collision) return { ok: false, message: `位置衝突: ${collision.deviceId}` };
-    const next = devices.map((d) => d.id === deviceId ? mode === "before" ? { ...d, beforeRackId: rackId, beforeStartU: sU, beforeEndU: eU } : { ...d, afterRackId: rackId, afterStartU: sU, afterEndU: eU } : d);
-    writeJson(LS.devices, next); set({ devices: next }); return { ok: true };
+    
+    let updatedDevice: Device | null = null;
+    const next = devices.map((d) => {
+      if (d.id === deviceId) {
+        updatedDevice = mode === "before" ? { ...d, beforeRackId: rackId, beforeStartU: sU, beforeEndU: eU } : { ...d, afterRackId: rackId, afterStartU: sU, afterEndU: eU };
+        return updatedDevice;
+      }
+      return d;
+    });
+    writeJson(LS.devices, next); if (updatedDevice) syncToFirebase(updatedDevice); set({ devices: next }); return { ok: true };
   }
 }));
 
@@ -161,8 +211,8 @@ function LoginPage() {
       <div className="w-full max-w-md bg-[var(--panel)] border border-[var(--border)] rounded-3xl shadow-2xl p-6">
         <div className="flex items-center gap-3"><div className="w-10 h-10 rounded-xl flex items-center justify-center text-black" style={{ background: "linear-gradient(135deg,var(--accent),var(--accent2))", boxShadow: "0 0 18px rgba(34,211,238,0.25)" }}><Server size={18} /></div><div><div className="text-lg font-black">MigratePro</div><div className="text-xs text-[var(--muted)]">機房搬遷專案管理</div></div></div>
         <div className="mt-5 space-y-3">
-          <div><label className="text-xs text-[var(--muted)]">帳號(預設admin)</label><input className="mt-1 w-full bg-[var(--panel2)] border border-[var(--border)] rounded-xl px-3 py-2 text-sm outline-none" value={u} onChange={(e) => setU(e.target.value)} /></div>
-          <div><label className="text-xs text-[var(--muted)]">密碼(預設123)</label><input type="password" className="mt-1 w-full bg-[var(--panel2)] border border-[var(--border)] rounded-xl px-3 py-2 text-sm outline-none" value={p} onChange={(e) => setP(e.target.value)} /></div>
+          <div><label className="text-xs text-[var(--muted)]">帳號(預設admin)</label><input className="mt-1 w-full bg-[var(--panel2)] border border-[var(--border)] rounded-xl px-3 py-2 text-sm outline-none focus:border-[var(--accent)]" value={u} onChange={(e) => setU(e.target.value)} /></div>
+          <div><label className="text-xs text-[var(--muted)]">密碼(預設123)</label><input type="password" className="mt-1 w-full bg-[var(--panel2)] border border-[var(--border)] rounded-xl px-3 py-2 text-sm outline-none focus:border-[var(--accent)]" value={p} onChange={(e) => setP(e.target.value)} /></div>
           {err && <div className="text-sm text-red-400">{err}</div>}
           <button onClick={() => { setErr(null); const res = login(u, p); if (!res.ok) setErr(res.message || "登入失敗"); }} className="w-full mt-2 bg-[var(--accent)] text-black font-extrabold py-3 rounded-xl hover:opacity-90">登入</button>
         </div>
@@ -388,7 +438,46 @@ const RackPlanner = ({ mode }: { mode: PlacementMode }) => {
 
 export default function App() {
   const { isAuthed, theme, page, setPage } = useStore();
+  
   useEffect(() => { document.documentElement.classList.toggle("dark", theme === "dark"); }, [theme]);
+
+  // 監聽 Firebase 資料庫變動 (即時同步)
+  useEffect(() => {
+    let unsubscribeSnapshot = () => {};
+    
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) {
+        console.error("Firebase Auth Error", e);
+      }
+    };
+    if (isFirebaseConfigured) initAuth();
+
+    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+      if (!user || !isFirebaseConfigured) return;
+      
+      const devicesRef = collection(db, 'artifacts', appId, 'public', 'data', 'devices');
+      unsubscribeSnapshot = onSnapshot(devicesRef, (snapshot) => {
+        const devicesData = snapshot.docs.map(doc => doc.data() as Device);
+        if (devicesData.length > 0) {
+          useStore.setState({ devices: devicesData });
+        }
+      }, (error) => {
+        console.error("Firestore snapshot error:", error);
+      });
+    });
+
+    return () => {
+      unsubscribeAuth();
+      unsubscribeSnapshot();
+    };
+  }, []);
+
   if (!isAuthed) return <LoginPage />;
   return (
     <>
