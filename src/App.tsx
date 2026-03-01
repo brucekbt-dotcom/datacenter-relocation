@@ -34,9 +34,21 @@ const firebaseConfig = firebaseConfigStr ? JSON.parse(firebaseConfigStr) : {
 
 const isFirebaseConfigured = firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY";
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
+let app: any;
+let auth: any;
+let db: any;
+
+// 【修復白屏關鍵】：只有在擁有真實 API Key 時，才啟動 Firebase
+try {
+  if (isFirebaseConfigured) {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+  }
+} catch (error) {
+  console.error("Firebase 初始化失敗，將退回單機模式：", error);
+}
+
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'datacenter-relocation-app';
 
 /* -----------------------------
@@ -107,13 +119,13 @@ interface Store {
 }
 
 const syncToFirebase = async (device: Device) => {
-  if (!isFirebaseConfigured) return;
+  if (!isFirebaseConfigured || !db) return;
   try { await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'devices', device.id), device); } 
   catch (e) { console.error("Firebase sync error:", e); }
 };
 
 const deleteFromFirebase = async (id: string) => {
-  if (!isFirebaseConfigured) return;
+  if (!isFirebaseConfigured || !db) return;
   try { await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'devices', id)); } 
   catch (e) { console.error("Firebase delete error:", e); }
 };
@@ -447,9 +459,9 @@ export default function App() {
     
     const initAuth = async () => {
       try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token && auth) {
           await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
+        } else if (auth) {
           await signInAnonymously(auth);
         }
       } catch (e) {
@@ -458,8 +470,8 @@ export default function App() {
     };
     if (isFirebaseConfigured) initAuth();
 
-    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
-      if (!user || !isFirebaseConfigured) return;
+    const unsubscribeAuth = auth ? onAuthStateChanged(auth, (user) => {
+      if (!user || !isFirebaseConfigured || !db) return;
       
       const devicesRef = collection(db, 'artifacts', appId, 'public', 'data', 'devices');
       unsubscribeSnapshot = onSnapshot(devicesRef, (snapshot) => {
@@ -470,7 +482,7 @@ export default function App() {
       }, (error) => {
         console.error("Firestore snapshot error:", error);
       });
-    });
+    }) : () => {};
 
     return () => {
       unsubscribeAuth();
